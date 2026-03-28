@@ -10,7 +10,19 @@ from app.db.session import SessionLocal
 from app.models.user import User
 
 
-VALID_ROLES = {"Admin", "Security", "Auditor"}
+ROLE_ALIASES = {
+    "admin": "admin",
+    "security": "security_approver",
+    "security_approver": "security_approver",
+    "auditor": "viewer",
+    "viewer": "viewer",
+    "developer": "developer",
+}
+VALID_ROLES = {"admin", "security_approver", "developer", "viewer"}
+
+
+def normalize_role(role: str) -> str:
+    return ROLE_ALIASES.get((role or "").strip().lower(), "")
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -48,12 +60,13 @@ def get_current_user(
 
 
 def require_roles(*roles: str):
-    required = set(roles)
+    required = {normalize_role(role) for role in roles if normalize_role(role)}
 
     def checker(user: User = Depends(get_current_user)) -> User:
-        if user.role not in VALID_ROLES:
+        user_role = normalize_role(user.role)
+        if user_role not in VALID_ROLES:
             raise HTTPException(status_code=403, detail="Unknown role")
-        if required and user.role not in required:
+        if required and user_role not in required:
             raise HTTPException(status_code=403, detail="Insufficient role")
         return user
 

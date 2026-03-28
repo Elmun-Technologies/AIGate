@@ -28,3 +28,9 @@ class PolicyOut(BaseModel):
     yaml_text: str
     is_active: bool
     created_at: datetime
+
+
+class PolicyCreateFromTemplate(BaseModel):
+    template_key: str
+    name: str | None = None
+    is_active: bool = True

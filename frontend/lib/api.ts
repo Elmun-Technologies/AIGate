@@ -21,6 +21,13 @@ export async function apiRequest(path: string, options: RequestInit = {}, withAu
   });
 
   if (!response.ok) {
+    // Auto-logout on 401: token expired or invalid
+    if (response.status === 401 && withAuth && typeof window !== "undefined") {
+      localStorage.removeItem("token");
+      localStorage.removeItem("user");
+      window.location.href = "/login";
+      throw new Error("Session expired. Please log in again.");
+    }
     let message = `HTTP ${response.status}`;
     try {
       const data = await response.json();
@@ -36,4 +43,27 @@ export async function apiRequest(path: string, options: RequestInit = {}, withAu
   }
 
   return response.json();
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function apiRequestWithRetry(
+  path: string,
+  options: RequestInit = {},
+  withAuth = true,
+  retries = 3,
+  delayMs = 1000,
+) {
+  for (let i = 0; i < retries; i += 1) {
+    try {
+      return await apiRequest(path, options, withAuth);
+    } catch {
+      if (i < retries - 1) {
+        await sleep(delayMs * (i + 1));
+      }
+    }
+  }
+  return null;
 }

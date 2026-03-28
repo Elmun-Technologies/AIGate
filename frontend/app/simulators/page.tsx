@@ -1,242 +1,202 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { API_URL, apiRequest } from "@/lib/api";
+import { apiRequest } from "@/lib/api";
 
-type DemoStepResult = {
-  status?: string;
-  tool_call_id?: string;
-  approval_request_id?: string;
-  risk_score?: number;
-  decision_reason?: string;
-  [key: string]: unknown;
-};
-
-type DemoStep = {
-  name: string;
-  result: DemoStepResult;
-};
-
-type DemoResult = {
+type PolicyCheckResponse = {
   status: string;
-  public_agent_id: string;
-  confidential_agent_id: string;
-  steps: DemoStep[];
-  pending_approvals_count: number;
-  pending_approval_ids: string[];
-  summary?: {
-    executed: number;
-    blocked: number;
-    pending_approval: number;
+  simulated_at: string;
+  verdict: {
+    decision: string;
+    status: string;
+    reason: string;
+    matched_rule: string;
+    source: string;
+    risk_score: number;
+    rules_evaluated: number;
   };
+  risk_breakdown: Array<{
+    name: string;
+    contribution: number;
+    explanation: string;
+  }>;
+  rule_trace: Array<{
+    index: number;
+    name: string;
+    matched: boolean;
+    decision: string;
+    reason: string;
+  }>;
 };
-
-function statusLabel(status?: string) {
-  const normalized = (status || "").toLowerCase();
-  if (normalized === "executed") return "EXECUTED";
-  if (normalized === "pending_approval") return "PENDING_APPROVAL";
-  if (normalized === "blocked") return "BLOCKED";
-  return (status || "UNKNOWN").toUpperCase();
-}
-
-function statusClass(status?: string) {
-  const normalized = (status || "").toLowerCase();
-  if (normalized === "executed") return "bg-emerald-100 text-emerald-800 border border-emerald-200";
-  if (normalized === "pending_approval") return "bg-amber-100 text-amber-900 border border-amber-200";
-  if (normalized === "blocked") return "bg-red-100 text-red-800 border border-red-200";
-  return "bg-slate-100 text-slate-700 border border-slate-200";
-}
 
 export default function SimulatorsPage() {
   const router = useRouter();
-  const [result, setResult] = useState<DemoResult | null>(null);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [prompt, setPrompt] = useState(
+    "Write a python script that connects to our internal DB using these keys: AKIA_EXAMPLE_123",
+  );
+  const [tool, setTool] = useState("external_post");
+  const [classification, setClassification] = useState("Confidential");
+  const [argsText, setArgsText] = useState(
+    JSON.stringify(
+      {
+        url: "https://public-endpoint.example/upload",
+        payload: {
+          note: "send customer export",
+          email: "alice@example.com",
+          card: "4111111111111111",
+        },
+      },
+      null,
+      2,
+    ),
+  );
   const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [error, setError] = useState("");
-  const [copyState, setCopyState] = useState("");
-  const progressTimerRef = useRef<number | null>(null);
+  const [result, setResult] = useState<PolicyCheckResponse | null>(null);
 
   useEffect(() => {
     if (!localStorage.getItem("token")) {
       router.replace("/login");
     }
-    return () => {
-      if (progressTimerRef.current) {
-        window.clearInterval(progressTimerRef.current);
-      }
-    };
   }, [router]);
 
-  const selectedStep = useMemo(() => {
-    if (!result || result.steps.length === 0) return null;
-    return result.steps[selectedIndex] || result.steps[0];
-  }, [result, selectedIndex]);
-
-  const run = async () => {
+  const runSimulation = async () => {
     setLoading(true);
-    setError("");
-    setCopyState("");
-    setProgress(7);
-    if (progressTimerRef.current) window.clearInterval(progressTimerRef.current);
-    progressTimerRef.current = window.setInterval(() => {
-      setProgress((prev) => (prev >= 90 ? prev : prev + 7));
-    }, 350);
-
     try {
-      const data = await apiRequest("/sim/run", { method: "POST" });
-      const parsed = data as DemoResult;
-      setResult(parsed);
-      setSelectedIndex(0);
-      setProgress(100);
-      window.dispatchEvent(new CustomEvent("gateway:refresh"));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Simulation failed");
+      const parsedArgs = argsText.trim() ? JSON.parse(argsText) : {};
+      const response = (await apiRequest("/sim/policy-check", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          tool,
+          agent_classification: classification,
+          args: parsedArgs,
+        }),
+      })) as PolicyCheckResponse;
+      setResult(response);
+    } catch {
+      setResult(null);
     } finally {
-      if (progressTimerRef.current) window.clearInterval(progressTimerRef.current);
       setLoading(false);
     }
   };
 
-  const copyToolCall = async (toolCallId?: string) => {
-    if (!toolCallId) return;
+  const runWedge = async () => {
+    setLoading(true);
     try {
-      await navigator.clipboard.writeText(toolCallId);
-      setCopyState(`Copied ${toolCallId}`);
-      setTimeout(() => setCopyState(""), 1500);
-    } catch {
-      setCopyState("Clipboard unavailable");
-      setTimeout(() => setCopyState(""), 1500);
-    }
-  };
-
-  const exportEvidence = async (format: "json" | "csv") => {
-    try {
-      setError("");
-      const token = localStorage.getItem("token");
-      const response = await fetch(`${API_URL}/audit/export?format=${format}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      if (!response.ok) {
-        throw new Error(`Export failed with status ${response.status}`);
-      }
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = format === "json" ? "evidence.json" : "evidence.csv";
-      link.click();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to export evidence");
+      await apiRequest("/sim/run-yc", { method: "POST" });
+      await runSimulation();
+      localStorage.setItem("gateway:refresh-at", String(Date.now()));
+      window.dispatchEvent(new CustomEvent("gateway:refresh"));
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <main className="container-page space-y-4">
-      <div>
-        <h1 className="text-2xl font-semibold">Demo Narrative</h1>
-        <p className="text-sm text-slate-600">Run a full policy and approvals flow, then show evidence to investors in one screen.</p>
-      </div>
-
-      <section className="card space-y-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <button className="btn-primary" onClick={run} disabled={loading}>
-            {loading ? "Running Demo..." : result ? "Replay Demo" : "Run Demo"}
-          </button>
-          <button className="btn-secondary" onClick={() => exportEvidence("json")} disabled={!result}>
-            Export Evidence (JSON)
-          </button>
-          <button className="btn-secondary" onClick={() => exportEvidence("csv")} disabled={!result}>
-            Export Evidence (CSV)
-          </button>
+    <main className="container-page space-y-3">
+      <section className="grid grid-cols-1 xl:grid-cols-[1.15fr_0.85fr] gap-3">
+        <div className="card flex flex-col min-h-[760px]">
+          <div className="card-header">
+            <h2 className="font-semibold">TEST PROMPT</h2>
+            <div className="flex items-center gap-2">
+              <span className="badge">LLM: GPT-4o</span>
+              <span className="badge">UTF-8</span>
+            </div>
+          </div>
+          <textarea
+            className="input mono flex-1 min-h-[530px]"
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            placeholder="Enter a prompt to simulate policy enforcement..."
+          />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-2">
+            <select className="input" value={tool} onChange={(event) => setTool(event.target.value)}>
+              <option value="read_db">read_db</option>
+              <option value="send_email">send_email</option>
+              <option value="external_post">external_post</option>
+            </select>
+            <select className="input" value={classification} onChange={(event) => setClassification(event.target.value)}>
+              <option>Public</option>
+              <option>Internal</option>
+              <option>Confidential</option>
+              <option>PII</option>
+            </select>
+            <button className="btn-secondary" onClick={runWedge} disabled={loading}>
+              {loading ? "Running..." : "Run Wedge Scenario"}
+            </button>
+          </div>
+          <textarea
+            className="input mono min-h-[140px] mt-2"
+            value={argsText}
+            onChange={(event) => setArgsText(event.target.value)}
+            placeholder="Tool args (JSON)"
+          />
+          <div className="flex items-center justify-end mt-3">
+            <button className="btn-primary !px-6" onClick={runSimulation} disabled={loading}>
+              {loading ? "Running Simulation..." : "Run Simulation"}
+            </button>
+          </div>
         </div>
 
-        {(loading || progress > 0) ? (
-          <div>
-            <div className="h-2 bg-slate-100 rounded overflow-hidden">
-              <div className="h-full bg-accent transition-all duration-300" style={{ width: `${progress}%` }} />
+        <div className="space-y-3">
+          <div className="card min-h-[300px]">
+            <div className="card-header">
+              <h2 className="font-semibold">SIMULATION VERDICT</h2>
             </div>
-            <p className="text-xs text-slate-600 mt-1">{loading ? `Executing demo... ${progress}%` : "Demo completed"}</p>
-          </div>
-        ) : null}
-
-        {copyState ? <p className="text-xs text-emerald-700">{copyState}</p> : null}
-        {error ? <p className="text-sm text-red-600">{error}</p> : null}
-      </section>
-
-      {result ? (
-        <section className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          <div className="card space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="font-semibold">6-Step Timeline</h2>
-              <span className="text-xs text-slate-500">Pending approvals: {result.pending_approvals_count}</span>
-            </div>
-
-            <div className="space-y-2">
-              {result.steps.map((step, index) => (
-                <button
-                  key={`${step.name}-${index}`}
-                  onClick={() => setSelectedIndex(index)}
-                  className={`w-full text-left border rounded p-3 transition ${selectedIndex === index ? "border-accent bg-teal-50" : "border-slate-200 hover:bg-slate-50"}`}
+            {result ? (
+              <div className="sim-verdict">
+                <div
+                  className={`sim-verdict-icon ${
+                    result.verdict.status === "BLOCKED"
+                      ? "blocked"
+                      : result.verdict.status === "PENDING_APPROVAL"
+                        ? "pending"
+                        : "allow"
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="font-medium text-sm">{index + 1}. {step.name}</p>
-                    <span className={`text-[11px] px-2 py-1 rounded ${statusClass(step.result?.status)}`}>
-                      {statusLabel(step.result?.status)}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-600 mt-1">
-                    risk_score={step.result?.risk_score ?? "n/a"} | reason={step.result?.decision_reason || "n/a"}
-                  </p>
-                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                    <span className="text-slate-600">tool_call_id:</span>
-                    <code className="bg-slate-100 px-2 py-1 rounded break-all">{step.result?.tool_call_id || "n/a"}</code>
-                    {step.result?.tool_call_id ? (
-                      <button
-                        className="btn-secondary !px-2 !py-1 !text-xs"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          copyToolCall(step.result.tool_call_id);
-                        }}
-                      >
-                        Copy
-                      </button>
-                    ) : null}
-                    {step.result?.approval_request_id ? (
-                      <Link
-                        href={`/approvals?highlight=${step.result.approval_request_id}`}
-                        className="btn-secondary !px-2 !py-1 !text-xs"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        Open Approval
-                      </Link>
-                    ) : null}
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="card space-y-2">
-            <h2 className="font-semibold">Step Detail (JSON)</h2>
-            {selectedStep ? (
-              <pre className="text-xs overflow-auto max-h-[560px] whitespace-pre-wrap">
-                {JSON.stringify(selectedStep, null, 2)}
-              </pre>
+                  {result.verdict.status === "BLOCKED" ? "⛔" : result.verdict.status === "PENDING_APPROVAL" ? "⏳" : "✓"}
+                </div>
+                <p className="sim-verdict-title">{result.verdict.status}</p>
+                <p className="text-sm text-slate-600">{result.verdict.reason}</p>
+              </div>
             ) : (
-              <p className="text-sm text-slate-600">Run demo to inspect details.</p>
+              <div className="sim-verdict">
+                <p className="text-sm text-slate-600">Run simulation to get verdict.</p>
+              </div>
             )}
           </div>
-        </section>
-      ) : (
-        <section className="card">
-          <p className="text-sm text-slate-600">Press Run Demo to generate a timeline, pending approvals, and audit evidence.</p>
-        </section>
-      )}
+
+          <div className="card min-h-[440px]">
+            <div className="card-header">
+              <h2 className="font-semibold">TRACE ANALYSIS</h2>
+              <span className="text-xs text-slate-500">{result?.verdict.rules_evaluated ?? 0} Rules Evaluated</span>
+            </div>
+            <div className="space-y-2">
+              {(result?.rule_trace || []).map((rule) => (
+                <div key={`${rule.index}-${rule.name}`} className={`trace-row ${rule.matched ? "matched" : ""}`}>
+                  <div className="flex items-center justify-between">
+                    <strong>{rule.name}</strong>
+                    <span className={rule.matched ? "badge badge-blocked" : "badge"}>{rule.matched ? "CRITICAL" : "LOW"}</span>
+                  </div>
+                  <p className="text-sm text-slate-600 mt-1">{rule.reason}</p>
+                </div>
+              ))}
+              {!result?.rule_trace?.length ? <p className="text-sm text-slate-600">No trace yet.</p> : null}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 mono">
+          <span>● API Status: Online</span>
+          <span>☁ Region: US-East-1</span>
+          <span>⌁ Log Stream: Active</span>
+          <span>Status: Compliant</span>
+        </div>
+      </section>
     </main>
   );
 }

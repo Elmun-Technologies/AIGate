@@ -18,4 +18,7 @@ class ToolCallResponse(BaseModel):
     approval_request_id: UUID | None = None
     risk_score: int
     decision_reason: str
+    risk_breakdown: list[dict[str, Any]] | None = None
+    destination_domain: str | None = None
+    runtime_token: str | None = None
     result: dict[str, Any] | None = None

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.api.deps import normalize_role
 from app.core.security import create_access_token, get_password_hash, verify_password
 from app.models.user import User
 from app.schemas.auth import LoginRequest, LoginResponse, RegisterRequest
@@ -12,8 +13,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", response_model=UserOut)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> User:
-    if payload.role not in {"Admin", "Security", "Auditor"}:
-        raise HTTPException(status_code=400, detail="Role must be Admin, Security, or Auditor")
+    role = normalize_role(payload.role)
+    if role not in {"admin", "security_approver", "developer", "viewer"}:
+        raise HTTPException(status_code=400, detail="Role must be admin, security_approver, developer, or viewer")
 
     exists = db.query(User).filter(User.email == payload.email).first()
     if exists:
@@ -22,7 +24,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> User:
     user = User(
         email=payload.email,
         password_hash=get_password_hash(payload.password),
-        role=payload.role,
+        role=role,
     )
     db.add(user)
     db.commit()
@@ -36,5 +38,5 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_access_token(subject=user.email, role=user.role)
+    token = create_access_token(subject=user.email, role=normalize_role(user.role) or user.role)
     return LoginResponse(access_token=token, user=user)

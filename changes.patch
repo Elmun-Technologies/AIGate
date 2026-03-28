@@ -1,0 +1,432 @@
+diff --git a/.env.example b/.env.example
+index aff29b6..de9da45 100644
+--- a/.env.example
++++ b/.env.example
+@@ -11,6 +11,8 @@ APP_ENV=dev
+ LOG_LEVEL=debug
+ SPEND_DAILY_THRESHOLD_USD=100
+ SPEND_SPIKE_PERCENT=300
++AI_DEFAULT_ORGANIZATION_ID=11111111-1111-1111-1111-111111111111
++AI_DAILY_SPIKE_MULTIPLIER=3.0
+ 
+ # Demo login (informational; seeded by backend on startup)
+ DEMO_ADMIN_EMAIL=admin@example.com
+diff --git a/README.md b/README.md
+index ac25786..6bff160 100644
+--- a/README.md
++++ b/README.md
+@@ -43,6 +43,17 @@ Inline enforcement control plane for AI agent tool calls. Tool execution is gate
+    - provider breakdown and shadow AI events via API (`/spend/providers`, `/shadow-ai/events`)
+ 4. Create a low threshold alert and refresh to show alert state transitions.
+ 
++## AI Governance API
++
++- `POST /telemetry/ingest`
++- `GET /ai-governance/providers`
++- `GET /ai-governance/keys`
++- `GET /ai-governance/usage?days=7`
++- `GET /ai-governance/subscriptions`
++- `GET /ai-governance/alerts`
++- `POST /ai-governance/alerts/{id}/resolve`
++- `GET /shadow-ai/events`
++
+ ## What This Proves
+ 
+ - Policy enforcement works inline before tool execution (allow, block, require approval).
+diff --git a/backend/alembic/env.py b/backend/alembic/env.py
+index f190662..c373dd9 100644
+--- a/backend/alembic/env.py
++++ b/backend/alembic/env.py
+@@ -5,7 +5,7 @@ from sqlalchemy import engine_from_config, pool
+ 
+ from app.core.config import settings
+ from app.db.base import Base
+-from app.models import alert, agent, approval_request, audit_event, policy, provider_usage_event, spend_aggregate, spend_alert, spend_anomaly, tool, tool_call, user  # noqa: F401
++from app.models import ai_billing_subscription, ai_provider, ai_spend_alert, ai_usage_event, alert, agent, api_key, approval_request, audit_event, policy, provider_usage_event, spend_aggregate, spend_alert, spend_anomaly, tool, tool_call, user  # noqa: F401
+ 
+ config = context.config
+ config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+diff --git a/backend/app/api/routes/telemetry.py b/backend/app/api/routes/telemetry.py
+index 61f39b7..d719c8d 100644
+--- a/backend/app/api/routes/telemetry.py
++++ b/backend/app/api/routes/telemetry.py
+@@ -1,18 +1,17 @@
+ from datetime import datetime, timezone
+-from decimal import Decimal
+ 
+ from fastapi import APIRouter, Depends, Query
+ from rq import Queue
+ from sqlalchemy.orm import Session
+ 
+ from app.api.deps import get_db, get_rq_queue, require_roles
+-from app.models.provider_usage_event import ProviderUsageEvent
++from app.models.ai_provider import AIProvider
++from app.models.ai_usage_event import AIUsageEvent
++from app.models.api_key import APIKey
+ from app.schemas.telemetry import ShadowAIEventOut, TelemetryIngestRequest, TelemetryIngestResponse
+-from app.services.alert_engine import create_unknown_key_alert
+-from app.services.telemetry import ingest_telemetry_event
++from app.services.shadow_ai_detector import ingest_external_usage_event
+ 
+-AGGREGATE_SPEND_JOB = "app.worker_tasks.aggregate_spend_task"
+-EVALUATE_ALERTS_JOB = "app.worker_tasks.evaluate_alerts_task"
++GOVERNANCE_CYCLE_JOB = "app.worker_tasks.run_ai_governance_cycle_task"
+ 
+ router = APIRouter(tags=["telemetry"])
+ 
+@@ -23,10 +22,10 @@ def ingest_telemetry(
+     db: Session = Depends(get_db),
+     queue: Queue = Depends(get_rq_queue),
+     _=Depends(require_roles("Admin", "Security", "Auditor")),
+-) -> ProviderUsageEvent:
+-    usage = ingest_telemetry_event(
++) -> dict:
++    usage = ingest_external_usage_event(
+         db,
+-        provider=payload.provider,
++        provider_name=payload.provider,
+         api_key_hash=payload.api_key_hash,
+         model=payload.model,
+         cost_usd=payload.cost_usd,
+@@ -34,19 +33,17 @@ def ingest_telemetry(
+         tokens_in=payload.tokens_in,
+         tokens_out=payload.tokens_out,
+     )
+-    if usage.shadow_ai_usage:
+-        create_unknown_key_alert(
+-            db,
+-            api_key_fingerprint=usage.api_key_fingerprint or "unknown",
+-            provider=usage.provider,
+-            cost_usd=Decimal(usage.cost_usd),
+-        )
+-
++    api_key = db.query(APIKey).filter(APIKey.id == usage.api_key_id).first()
+     db.commit()
+     db.refresh(usage)
+-    queue.enqueue(AGGREGATE_SPEND_JOB)
+-    queue.enqueue(EVALUATE_ALERTS_JOB)
+-    return usage
++    queue.enqueue(GOVERNANCE_CYCLE_JOB)
++    return {
++        "id": usage.id,
++        "shadow_ai_usage": bool(api_key and api_key.status == "unknown"),
++        "detected_source": usage.detected_source,
++        "provider": payload.provider,
++        "timestamp": usage.created_at,
++    }
+ 
+ 
+ @router.get("/shadow-ai/events", response_model=list[ShadowAIEventOut])
+@@ -56,15 +53,36 @@ def list_shadow_ai_events(
+     provider: str | None = None,
+     db: Session = Depends(get_db),
+     _=Depends(require_roles("Admin", "Security", "Auditor")),
+-) -> list[ProviderUsageEvent]:
++) -> list[dict]:
+     end = to or datetime.now(timezone.utc)
+     start = from_ or (end.replace(hour=0, minute=0, second=0, microsecond=0))
+ 
+-    query = db.query(ProviderUsageEvent).filter(
+-        ProviderUsageEvent.shadow_ai_usage.is_(True),
+-        ProviderUsageEvent.timestamp >= start,
+-        ProviderUsageEvent.timestamp <= end,
++    query = (
++        db.query(AIUsageEvent, APIKey.masked_key, AIProvider.name.label("provider_name"))
++        .join(APIKey, APIKey.id == AIUsageEvent.api_key_id)
++        .join(AIProvider, AIProvider.id == AIUsageEvent.provider_id)
++        .filter(
++            APIKey.status == "unknown",
++            AIUsageEvent.created_at >= start,
++            AIUsageEvent.created_at <= end,
++        )
+     )
+     if provider:
+-        query = query.filter(ProviderUsageEvent.provider == provider.strip().lower())
+-    return query.order_by(ProviderUsageEvent.timestamp.desc()).limit(500).all()
++        query = query.filter(AIProvider.name == provider.strip().lower())
++    rows = query.order_by(AIUsageEvent.created_at.desc()).limit(500).all()
++    return [
++        {
++            "id": usage.id,
++            "provider": provider_name,
++            "masked_key": masked_key,
++            "model": usage.model,
++            "detected_source": usage.detected_source,
++            "source_hint": usage.source_hint,
++            "cost_usd": usage.cost_usd,
++            "tokens_in": usage.prompt_tokens,
++            "tokens_out": usage.completion_tokens,
++            "user_identifier": usage.user_identifier,
++            "created_at": usage.created_at,
++        }
++        for usage, masked_key, provider_name in rows
++    ]
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 8239df5..b1b7282 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -1,4 +1,5 @@
+ import os
++import uuid
+ from decimal import Decimal
+ 
+ 
+@@ -17,6 +18,8 @@ class Settings:
+     CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
+     SPEND_DAILY_THRESHOLD_USD = Decimal(os.getenv("SPEND_DAILY_THRESHOLD_USD", "100"))
+     SPEND_SPIKE_PERCENT = Decimal(os.getenv("SPEND_SPIKE_PERCENT", "300"))
++    AI_DEFAULT_ORGANIZATION_ID = uuid.UUID(os.getenv("AI_DEFAULT_ORGANIZATION_ID", "11111111-1111-1111-1111-111111111111"))
++    AI_DAILY_SPIKE_MULTIPLIER = Decimal(os.getenv("AI_DAILY_SPIKE_MULTIPLIER", "3.0"))
+ 
+ 
+ settings = Settings()
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 89b4e6a..81bccdf 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -2,6 +2,7 @@ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from app.api.routes.agents import router as agents_router
++from app.api.routes.ai_governance import router as ai_governance_router
+ from app.api.routes.approvals import router as approvals_router
+ from app.api.routes.audit import router as audit_router
+ from app.api.routes.auth import router as auth_router
+@@ -43,6 +44,7 @@ app.include_router(simulators_router)
+ app.include_router(dashboard_router)
+ app.include_router(spend_router)
+ app.include_router(telemetry_router)
++app.include_router(ai_governance_router)
+ 
+ 
+ @app.get("/health")
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index 1b184b2..073cb94 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -1,5 +1,10 @@
+ from app.models.alert import Alert
++from app.models.ai_billing_subscription import AIBillingSubscription
++from app.models.ai_provider import AIProvider
++from app.models.ai_spend_alert import AISpendAlert
++from app.models.ai_usage_event import AIUsageEvent
+ from app.models.agent import Agent
++from app.models.api_key import APIKey
+ from app.models.approval_request import ApprovalRequest
+ from app.models.audit_event import AuditEvent
+ from app.models.policy import Policy
+@@ -24,4 +29,9 @@ __all__ = [
+     "SpendAggregate",
+     "SpendAnomaly",
+     "Alert",
++    "AIProvider",
++    "APIKey",
++    "AIUsageEvent",
++    "AIBillingSubscription",
++    "AISpendAlert",
+ ]
+diff --git a/backend/app/schemas/telemetry.py b/backend/app/schemas/telemetry.py
+index b2e9290..b500784 100644
+--- a/backend/app/schemas/telemetry.py
++++ b/backend/app/schemas/telemetry.py
+@@ -36,15 +36,14 @@ class TelemetryIngestResponse(BaseModel):
+ 
+ 
+ class ShadowAIEventOut(BaseModel):
+-    model_config = ConfigDict(from_attributes=True)
+-
+     id: UUID
+     provider: str
+-    api_key_fingerprint: str | None
++    masked_key: str | None = None
+     model: str | None
+     detected_source: str
+     source_hint: str | None
+     cost_usd: Decimal
+     tokens_in: int | None
+     tokens_out: int | None
+-    timestamp: datetime
++    user_identifier: str | None = None
++    created_at: datetime
+diff --git a/backend/app/seed.py b/backend/app/seed.py
+index af5494f..1cac569 100644
+--- a/backend/app/seed.py
++++ b/backend/app/seed.py
+@@ -1,6 +1,7 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.core.config import settings
++from app.models.ai_provider import AIProvider
+ from app.core.security import get_password_hash, hash_api_key
+ from app.models.agent import Agent
+ from app.models.policy import Policy
+@@ -44,6 +45,17 @@ rules:
+ 
+ 
+ def seed_defaults(db: Session) -> None:
++    providers = [
++        {"name": "openai", "type": "api"},
++        {"name": "anthropic", "type": "api"},
++        {"name": "gemini", "type": "api"},
++        {"name": "perplexity", "type": "saas"},
++    ]
++    for provider in providers:
++        exists = db.query(AIProvider).filter(AIProvider.name == provider["name"]).first()
++        if not exists:
++            db.add(AIProvider(**provider))
++
+     tools = [
+         {
+             "name": "send_email",
+diff --git a/backend/app/services/gateway_service.py b/backend/app/services/gateway_service.py
+index d79b396..d02ae6b 100644
+--- a/backend/app/services/gateway_service.py
++++ b/backend/app/services/gateway_service.py
+@@ -14,6 +14,7 @@ from app.services.audit_chain import append_audit_event
+ from app.services.policy_engine import evaluate_policy
+ from app.services.redaction import redact_data
+ from app.services.risk import calculate_risk
++from app.services.shadow_ai_detector import analyze_tool_call
+ from app.services.spend import apply_spend_on_create, apply_spend_on_execute
+ from app.services.telemetry import upsert_tool_call_usage_event
+ from app.services.tool_executor import execute_tool_call
+@@ -21,6 +22,7 @@ from app.services.tool_executor import execute_tool_call
+ PENDING_APPROVAL_JOB = "app.worker_tasks.pending_approval_notification"
+ AGGREGATE_SPEND_JOB = "app.worker_tasks.aggregate_spend_task"
+ EVALUATE_ALERTS_JOB = "app.worker_tasks.evaluate_alerts_task"
++GOVERNANCE_CYCLE_JOB = "app.worker_tasks.run_ai_governance_cycle_task"
+ 
+ 
+ def _normalize_payload(request: ToolCallRequest) -> tuple[str, str, dict]:
+@@ -39,6 +41,10 @@ def _enqueue_spend_jobs(queue: Queue) -> None:
+     queue.enqueue(EVALUATE_ALERTS_JOB)
+ 
+ 
++def _enqueue_governance_jobs(queue: Queue) -> None:
++    queue.enqueue(GOVERNANCE_CYCLE_JOB)
++
++
+ def process_gateway_tool_call(db: Session, queue: Queue, request: ToolCallRequest) -> dict:
+     tool_name, prompt, args = _normalize_payload(request)
+ 
+@@ -128,9 +134,21 @@ def process_gateway_tool_call(db: Session, queue: Queue, request: ToolCallReques
+ 
+     if decision == "BLOCK":
+         tool_call.status = "blocked"
++        analyze_tool_call(
++            db,
++            tool_call=tool_call,
++            agent=agent,
++            tool_name=tool_name,
++            args=args,
++            prompt=prompt,
++            response=None,
++            fallback_provider=tool_call.provider,
++            source_hint="proxy",
++        )
+         upsert_tool_call_usage_event(db, tool_call=tool_call, api_key_fingerprint=agent.api_key_hash, source_hint="backend")
+         db.commit()
+         _enqueue_spend_jobs(queue)
++        _enqueue_governance_jobs(queue)
+         return {
+             "status": "blocked",
+             "tool_call_id": tool_call.id,
+@@ -159,10 +177,22 @@ def process_gateway_tool_call(db: Session, queue: Queue, request: ToolCallReques
+             risk_score=risk_score,
+         )
+ 
++        analyze_tool_call(
++            db,
++            tool_call=tool_call,
++            agent=agent,
++            tool_name=tool_name,
++            args=args,
++            prompt=prompt,
++            response=None,
++            fallback_provider=tool_call.provider,
++            source_hint="proxy",
++        )
+         upsert_tool_call_usage_event(db, tool_call=tool_call, api_key_fingerprint=agent.api_key_hash, source_hint="backend")
+         db.commit()
+         queue.enqueue(PENDING_APPROVAL_JOB, str(approval.id))
+         _enqueue_spend_jobs(queue)
++        _enqueue_governance_jobs(queue)
+         return {
+             "status": "pending_approval",
+             "tool_call_id": tool_call.id,
+@@ -176,6 +206,17 @@ def process_gateway_tool_call(db: Session, queue: Queue, request: ToolCallReques
+     tool_call.status = "executed"
+     tool_call.response_json_redacted = redact_data(execution_result)
+     apply_spend_on_execute(tool_call, prompt=prompt, args=args, response=execution_result)
++    analyze_tool_call(
++        db,
++        tool_call=tool_call,
++        agent=agent,
++        tool_name=tool_name,
++        args=args,
++        prompt=prompt,
++        response=execution_result,
++        fallback_provider=tool_call.provider,
++        source_hint="proxy",
++    )
+     upsert_tool_call_usage_event(db, tool_call=tool_call, api_key_fingerprint=agent.api_key_hash, source_hint="backend")
+ 
+     append_audit_event(
+@@ -195,6 +236,7 @@ def process_gateway_tool_call(db: Session, queue: Queue, request: ToolCallReques
+ 
+     db.commit()
+     _enqueue_spend_jobs(queue)
++    _enqueue_governance_jobs(queue)
+     return {
+         "status": "executed",
+         "tool_call_id": tool_call.id,
+diff --git a/backend/app/worker_tasks.py b/backend/app/worker_tasks.py
+index 6891786..172eb30 100644
+--- a/backend/app/worker_tasks.py
++++ b/backend/app/worker_tasks.py
+@@ -8,6 +8,7 @@ from app.models.tool_call import ToolCall
+ from app.services.alert_engine import evaluate_alert_rules
+ from app.services.audit_chain import append_audit_event
+ from app.services.redaction import redact_data
++from app.services.shadow_ai_detector import analyze_tool_call, run_governance_cycle
+ from app.services.spend import apply_spend_on_execute
+ from app.services.spend_aggregation import aggregate_spend_data
+ from app.services.telemetry import upsert_tool_call_usage_event
+@@ -69,6 +70,17 @@ def execute_tool_call_task(tool_call_id: str) -> dict:
+         agent = db.query(Agent).filter(Agent.id == tool_call.agent_id).first()
+         if agent:
+             api_key_fingerprint = agent.api_key_hash
++        analyze_tool_call(
++            db,
++            tool_call=tool_call,
++            agent=agent,
++            tool_name=str((raw or {}).get("tool") or "unknown"),
++            args=(raw or {}).get("args") or {},
++            prompt=str((raw or {}).get("prompt") or ""),
++            response=result,
++            fallback_provider=tool_call.provider,
++            source_hint="proxy",
++        )
+         upsert_tool_call_usage_event(db, tool_call=tool_call, api_key_fingerprint=api_key_fingerprint, source_hint="backend")
+ 
+         append_audit_event(
+@@ -91,6 +103,7 @@ def execute_tool_call_task(tool_call_id: str) -> dict:
+         rq_queue = get_queue()
+         rq_queue.enqueue("app.worker_tasks.aggregate_spend_task")
+         rq_queue.enqueue("app.worker_tasks.evaluate_alerts_task")
++        rq_queue.enqueue("app.worker_tasks.run_ai_governance_cycle_task")
+         return {"status": "executed", "tool_call_id": tool_call_id, "result": result}
+     finally:
+         db.close()
+@@ -110,3 +123,11 @@ def evaluate_alerts_task() -> dict:
+         return evaluate_alert_rules(db)
+     finally:
+         db.close()
++
++
++def run_ai_governance_cycle_task() -> dict:
++    db: Session = SessionLocal()
++    try:
++        return run_governance_cycle(db)
++    finally:
++        db.close()

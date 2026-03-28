@@ -1,0 +1,68 @@
+# Local development overrides
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+services:
+  postgres:
+    healthcheck:
+      interval: 2s
+      retries: 5
+
+  redis:
+    healthcheck:
+      interval: 2s
+      retries: 5
+
+  mock-tools:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+
+  backend:
+    build:
+      context: ./backend
+      target: development
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: debug
+    healthcheck:
+      interval: 2s
+      timeout: 2s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-tools:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: ./backend
+      target: development
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-tools:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      target: development
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"

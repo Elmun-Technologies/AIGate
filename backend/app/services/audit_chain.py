@@ -1,13 +1,7 @@
-import hashlib
-import json
-
 from sqlalchemy.orm import Session
 
 from app.models.audit_event import AuditEvent
-
-
-def _canonical_json(data: dict) -> str:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+from app.services.audit_integrity import compute_chain_hash, get_stream_tail_event
 
 
 def append_audit_event(
@@ -18,15 +12,9 @@ def append_audit_event(
     decision: str,
     risk_score: int,
 ) -> AuditEvent:
-    previous = (
-        db.query(AuditEvent)
-        .filter(AuditEvent.stream_id == stream_id)
-        .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
-        .first()
-    )
+    previous = get_stream_tail_event(db=db, stream_id=stream_id)
     prev_hash = previous.chain_hash if previous else ""
-    canonical_payload = _canonical_json(payload_redacted_json)
-    chain_hash = hashlib.sha256(f"{prev_hash}{canonical_payload}".encode("utf-8")).hexdigest()
+    chain_hash = compute_chain_hash(prev_hash, payload_redacted_json)
 
     event = AuditEvent(
         stream_id=stream_id,

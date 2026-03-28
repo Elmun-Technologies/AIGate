@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-config
+data:
+  REDIS_URL: redis://agentgate-redis:6379/0
+  MOCK_TOOLS_BASE_URL: http://agentgate-mock-tools:9000
+  CORS_ORIGINS: http://localhost:3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgate-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgate-backend
+  template:
+    metadata:
+      labels:
+        app: agentgate-backend
+    spec:
+      containers:
+        - name: backend
+          image: agent-gateway-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: agentgate-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgate-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgate-worker
+  template:
+    metadata:
+      labels:
+        app: agentgate-worker
+    spec:
+      containers:
+        - name: worker
+          image: agent-gateway-worker:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: agentgate-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgate-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgate-frontend
+  template:
+    metadata:
+      labels:
+        app: agentgate-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: agent-gateway-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgate-backend
+spec:
+  selector:
+    app: agentgate-backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgate-frontend
+spec:
+  selector:
+    app: agentgate-frontend
+  ports:
+    - port: 3000
+      targetPort: 3000

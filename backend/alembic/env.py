@@ -5,7 +5,29 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
 from app.db.base import Base
-from app.models import alert, agent, approval_request, audit_event, policy, provider_usage_event, spend_aggregate, spend_alert, spend_anomaly, tool, tool_call, user  # noqa: F401
+from app.models import (
+    ai_billing_subscription,
+    ai_provider,
+    ai_spend_alert,
+    ai_usage_event,
+    alert,
+    agent,
+    api_key,
+    approval_request,
+    audit_anchor,
+    audit_event,
+    beta_signup,
+    loss_assumption,
+    policy,
+    policy_suggestion,
+    provider_usage_event,
+    spend_aggregate,
+    spend_alert,
+    spend_anomaly,
+    tool,
+    tool_call,
+    user,
+)  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

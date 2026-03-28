@@ -25,6 +25,22 @@ def _match_atomic(condition: dict[str, Any], context: dict[str, Any]) -> bool:
         ok = ok and context.get("agent_data_classification") in allowed
     if "risk_score_gte" in condition:
         ok = ok and int(context.get("risk_score", 0)) >= int(condition["risk_score_gte"])
+    if "payload_contains_pii" in condition:
+        ok = ok and bool(context.get("payload_contains_pii")) is bool(condition["payload_contains_pii"])
+    if "destination_domain_in" in condition:
+        allowed_domains = [str(x).lower() for x in _ensure_list(condition["destination_domain_in"])]
+        destination = str(context.get("destination_domain", "")).lower()
+        ok = ok and destination in allowed_domains
+    if "destination_domain_not_in" in condition:
+        denied_domains = [str(x).lower() for x in _ensure_list(condition["destination_domain_not_in"])]
+        destination = str(context.get("destination_domain", "")).lower()
+        ok = ok and destination not in denied_domains
+    if "destination_allowlisted" in condition:
+        ok = ok and bool(context.get("destination_allowlisted")) is bool(condition["destination_allowlisted"])
+    if "spend_agent_day_usd_gte" in condition:
+        ok = ok and float(context.get("spend_agent_day_usd", 0.0)) >= float(condition["spend_agent_day_usd_gte"])
+    if "owner_missing" in condition:
+        ok = ok and bool(context.get("owner_missing")) is bool(condition["owner_missing"])
     return ok
 
 
@@ -68,4 +84,4 @@ def evaluate_policy(yaml_text: str, context: dict[str, Any]) -> tuple[str, str, 
             name = str(rule.get("name", "unnamed-rule"))
             return decision, reason, name
 
-    return "ALLOW", "No rule matched", "default-allow"
+    return "REQUIRE_APPROVAL", "No explicit allow rule matched", "default-require-approval"

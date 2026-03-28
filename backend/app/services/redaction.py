@@ -2,7 +2,7 @@ import re
 from typing import Any
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
+PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)")
 CARD_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
 SENSITIVE_BLOCK_RE = re.compile(r"\[SENSITIVE\].*?\[/SENSITIVE\]", re.IGNORECASE | re.DOTALL)
 

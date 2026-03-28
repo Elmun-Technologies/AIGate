@@ -18,3 +18,9 @@ class ApprovalOut(BaseModel):
     reason: str | None
     created_at: datetime
     resolved_at: datetime | None
+    risk_score: int | None = None
+    decision_reason: str | None = None
+    tool_name: str | None = None
+    destination_domain: str | None = None
+    risk_breakdown: list[dict] | None = None
+    payload_preview: dict | None = None

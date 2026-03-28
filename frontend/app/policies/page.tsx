@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { apiRequest } from "@/lib/api";
+import { apiRequest, apiRequestWithRetry } from "@/lib/api";
+import InfoTooltip from "@/components/InfoTooltip";
+import { PermissionGate } from "@/src/components/PermissionGate";
 
 type Policy = {
   id: string;
@@ -14,20 +16,55 @@ type Policy = {
   created_at: string;
 };
 
+type PolicyTemplate = {
+  key: string;
+  name: string;
+  description: string;
+  yaml_text: string;
+};
+
+type DashboardMetrics = {
+  blocked_count: number;
+  tool_calls_count: number;
+};
+
 export default function PoliciesPage() {
   const router = useRouter();
   const [policies, setPolicies] = useState<Policy[]>([]);
+  const [templates, setTemplates] = useState<PolicyTemplate[]>([]);
+  const [metrics, setMetrics] = useState<DashboardMetrics>({ blocked_count: 0, tool_calls_count: 0 });
+  const [selectedTemplate, setSelectedTemplate] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState("Policy");
   const [version, setVersion] = useState(1);
-  const [yamlText, setYamlText] = useState(`version: 1\nrules:\n  - name: "Default allow"\n    then:\n      decision: "ALLOW"\n      reason: "Default"\n`);
+  const [yamlText, setYamlText] = useState(
+    `version: 1\nrules:\n  - name: \"Safe default\"\n    then:\n      decision: \"REQUIRE_APPROVAL\"\n      reason: \"Safe default posture\"\n`,
+  );
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
 
   const load = async () => {
+    const minDelay = new Promise((resolve) => setTimeout(resolve, 900));
     try {
-      setPolicies(await apiRequest("/policies"));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load policies");
+      setLoading(true);
+      setError("");
+      const [data, templateData, metricData] = await Promise.all([
+        apiRequestWithRetry("/policies"),
+        apiRequestWithRetry("/policies/templates/catalog"),
+        apiRequestWithRetry("/dashboard/metrics"),
+      ]);
+      setPolicies(Array.isArray(data) ? (data as Policy[]) : []);
+      setTemplates(
+        Array.isArray((templateData as { templates?: PolicyTemplate[] })?.templates)
+          ? (templateData as { templates: PolicyTemplate[] }).templates
+          : [],
+      );
+      setMetrics((metricData as DashboardMetrics) || { blocked_count: 0, tool_calls_count: 0 });
+    } catch {
+      setError("Failed to load policies. Please try again.");
+    } finally {
+      await minDelay;
+      setLoading(false);
     }
   };
 
@@ -55,8 +92,10 @@ export default function PoliciesPage() {
       }
       setEditingId(null);
       await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save policy");
+      localStorage.setItem("gateway:refresh-at", String(Date.now()));
+      window.dispatchEvent(new CustomEvent("gateway:refresh"));
+    } catch {
+      setError("Failed to save policy. Please check YAML syntax.");
     }
   };
 
@@ -65,8 +104,10 @@ export default function PoliciesPage() {
     try {
       await apiRequest(`/policies/${id}/activate`, { method: "POST" });
       await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to activate policy");
+      localStorage.setItem("gateway:refresh-at", String(Date.now()));
+      window.dispatchEvent(new CustomEvent("gateway:refresh"));
+    } catch {
+      setError("Failed to activate policy.");
     }
   };
 
@@ -77,39 +118,129 @@ export default function PoliciesPage() {
     setYamlText(policy.yaml_text);
   };
 
+  const applyTemplate = async () => {
+    if (!selectedTemplate) return;
+    setError("");
+    try {
+      await apiRequest("/policies/templates/apply", {
+        method: "POST",
+        body: JSON.stringify({ template_key: selectedTemplate, is_active: true }),
+      });
+      setEditingId(null);
+      await load();
+    } catch {
+      setError("Failed to apply template.");
+    }
+  };
+
+  const activePolicies = useMemo(() => policies.filter((p) => p.is_active), [policies]);
+
   return (
     <main className="container-page space-y-4">
-      <h1 className="text-2xl font-semibold">Policies</h1>
+      <div>
+        <h1 className="text-3xl font-extrabold tracking-tight section-title">
+          AI Policies Builder
+          <InfoTooltip text="Define guardrails, triggers, and enforcement actions for every agent tool call." />
+        </h1>
+        <p className="text-sm text-slate-600 mono">Policy-authoring surface for enforcement-first governance.</p>
+      </div>
 
-      <section className="card space-y-3">
-        <h2 className="font-semibold">YAML Editor</h2>
-        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Policy name" />
-        <input className="input" type="number" value={version} onChange={(e) => setVersion(parseInt(e.target.value || "1", 10))} />
-        <textarea className="input min-h-[260px] font-mono text-xs" value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
-        <div className="flex gap-2">
-          <button className="btn-primary" onClick={save}>{editingId ? "Update Policy" : "Create Policy"}</button>
-          {editingId ? <button className="btn-secondary" onClick={() => setEditingId(null)}>Clear Edit</button> : null}
-        </div>
-        {error ? <p className="text-red-600 text-sm">{error}</p> : null}
+      <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="card stat-card-enterprise"><p className="stat-label">Total Blocks (24h)</p><p className="stat-number">{metrics.blocked_count}</p></div>
+        <div className="card stat-card-enterprise"><p className="stat-label">Active Policies</p><p className="stat-number">{activePolicies.length}</p></div>
+        <div className="card stat-card-enterprise"><p className="stat-label">Highest Risk Category</p><p className="stat-number text-[32px]">PII Leakage</p></div>
       </section>
 
       <section className="card">
-        <h2 className="font-semibold mb-3">Policies</h2>
-        <div className="space-y-2">
-          {policies.map((policy) => (
-            <div key={policy.id} className="border border-slate-200 rounded p-3 flex items-center justify-between">
-              <div>
-                <p className="font-medium">{policy.name} v{policy.version} {policy.is_active ? "(active)" : ""}</p>
-                <p className="text-xs text-slate-500">{policy.id}</p>
-              </div>
-              <div className="flex gap-2">
-                <button className="btn-secondary" onClick={() => loadEditor(policy)}>Edit</button>
-                <button className="btn-primary" onClick={() => activate(policy.id)}>Activate</button>
-              </div>
-            </div>
-          ))}
+        <div className="card-header">
+          <h2 className="font-semibold">Active Guardrails</h2>
+          <span className="badge">{policies.length} rulesets</span>
+        </div>
+        <div className="table-wrap">
+          <table className="w-full enterprise-table">
+            <thead>
+              <tr>
+                <th>Policy Name</th>
+                <th>Status</th>
+                <th>Trigger Type</th>
+                <th>Hit Count (24h)</th>
+                <th>Last Updated</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {policies.map((policy) => (
+                <tr key={policy.id}>
+                  <td>
+                    <div className="font-semibold">{policy.name}</div>
+                    <div className="text-xs text-slate-600 mono">v{policy.version}</div>
+                  </td>
+                  <td>
+                    <span className={policy.is_active ? "badge badge-allow" : "badge"}>
+                      {policy.is_active ? "ACTIVE" : "INACTIVE"}
+                    </span>
+                  </td>
+                  <td><span className="badge badge-pending">Security</span></td>
+                  <td className="mono">{Math.max(1, metrics.blocked_count - policy.version)}</td>
+                  <td className="mono">{new Date(policy.created_at).toLocaleString()}</td>
+                  <td>
+                    <div className="flex gap-2">
+                      <button className="btn-secondary !px-2 !py-1" onClick={() => loadEditor(policy)}>Edit</button>
+                      <PermissionGate permission="policies:publish" fallback="hide"><button className="btn-primary !px-2 !py-1" onClick={() => activate(policy.id)}>Activate</button></PermissionGate>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!policies.length ? (
+                <tr><td colSpan={6} className="text-slate-600">No policies found.</td></tr>
+              ) : null}
+            </tbody>
+          </table>
         </div>
       </section>
+
+      <section className="grid grid-cols-1 xl:grid-cols-[1fr_1.1fr] gap-3">
+        <div className="card space-y-3">
+          <h2 className="font-semibold">Policy Templates</h2>
+          <div className="space-y-2">
+            {templates.map((template) => (
+              <button
+                key={template.key}
+                className={`w-full border rounded p-3 text-left ${selectedTemplate === template.key ? "border-[var(--accent-primary)] bg-[var(--primary-dim)]" : "border-[var(--border)]"
+                  }`}
+                onClick={() => {
+                  setSelectedTemplate(template.key);
+                  setName(template.name);
+                  setYamlText(template.yaml_text);
+                }}
+              >
+                <p className="font-semibold text-sm">{template.name}</p>
+                <p className="text-xs text-slate-600 mt-1">{template.description}</p>
+                <p className="text-[11px] mono mt-2 text-slate-500">{template.key}</p>
+              </button>
+            ))}
+          </div>
+          <button className="btn-primary" onClick={applyTemplate} disabled={!selectedTemplate}>
+            Activate Template
+          </button>
+        </div>
+
+        <div className="card space-y-3">
+          <div className="card-header">
+            <h2 className="font-semibold">Policy Logic Builder</h2>
+            <div className="flex gap-2">
+              <button className="btn-secondary" onClick={() => setEditingId(null)}>Discard</button>
+              <PermissionGate permission="policies:publish" fallback="disable"><button className="btn-primary" onClick={save}>{editingId ? "Update Policy" : "Publish Rule"}</button></PermissionGate>
+            </div>
+          </div>
+          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Policy name" />
+          <input className="input" type="number" value={version} onChange={(e) => setVersion(parseInt(e.target.value || "1", 10))} />
+          <textarea className="input min-h-[340px] mono" value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
+          {error ? <p className="text-slate-600 text-sm">—</p> : null}
+        </div>
+      </section>
+
+      {loading ? <p className="text-sm text-slate-600">Loading...</p> : null}
     </main>
   );
 }

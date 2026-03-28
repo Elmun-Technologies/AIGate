@@ -9,7 +9,7 @@ POSTGRES_DB="${POSTGRES_DB:-app}"
 
 # Keep Alembic/SQLAlchemy consistent with the DB env vars when DATABASE_URL is not set.
 if [ -z "${DATABASE_URL:-}" ]; then
-  export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+  export DATABASE_URL="postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 fi
 
 python /app/wait-for-db.py

@@ -3,22 +3,17 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { apiRequest } from "@/lib/api";
+import { apiRequest, apiRequestWithRetry } from "@/lib/api";
+import { useBudget, formatBudget, formatBudgetShort } from "@/lib/useBudget";
+import InfoTooltip from "@/components/InfoTooltip";
 
-type SpendSummary = {
-  total_usd: number;
-  by_day: Array<{ day: string; usd: number }>;
-  top_agents: Array<{ agent_id: string; agent_name?: string; usd: number; tool_calls: number }>;
-  top_tools: Array<{ tool: string; usd: number }>;
-  alerts_triggered: Array<{
-    id: string;
-    scope_type: string;
-    scope_id: string | null;
-    period: string;
-    threshold_usd: number;
-    status: string;
-    last_triggered_at: string | null;
-  }>;
+type ProviderSpend = {
+  provider: string;
+  usd: number;
+  tokens_in: number;
+  tokens_out: number;
+  events: number;
+  shadow_events: number;
 };
 
 type SpendAlert = {
@@ -29,17 +24,22 @@ type SpendAlert = {
   threshold_usd: string;
   status: "active" | "triggered" | "muted";
   last_triggered_at: string | null;
-  created_at: string;
+};
+
+type SpendAnomaly = {
+  id: string;
+  anomaly_date: string;
+  scope_type: string;
+  scope_id: string;
+  current_usd: number;
+  baseline_usd: number;
+  spike_percent: number;
 };
 
 type Agent = {
   id: string;
   name: string;
 };
-
-function formatMoney(value: number) {
-  return `$${value.toFixed(4)}`;
-}
 
 function formatDate(value: string | null) {
   if (!value) return "-";
@@ -50,13 +50,7 @@ function formatDate(value: string | null) {
 
 export default function SpendPage() {
   const router = useRouter();
-  const [summary, setSummary] = useState<SpendSummary>({
-    total_usd: 0,
-    by_day: [],
-    top_agents: [],
-    top_tools: [],
-    alerts_triggered: [],
-  });
+  const [anomalies, setAnomalies] = useState<SpendAnomaly[]>([]);
   const [alerts, setAlerts] = useState<SpendAlert[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [scopeType, setScopeType] = useState<"agent" | "org">("org");
@@ -64,35 +58,34 @@ export default function SpendPage() {
   const [period, setPeriod] = useState<"daily" | "monthly">("daily");
   const [thresholdUsd, setThresholdUsd] = useState("1.00");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const { spend, providers, loading: spendLoading } = useBudget();
 
   const maxDayUsd = useMemo(() => {
-    if (!summary.by_day.length) return 1;
-    return Math.max(...summary.by_day.map((item) => item.usd), 1);
-  }, [summary.by_day]);
+    if (!spend.by_day.length) return 1;
+    return Math.max(...spend.by_day.map((item) => item.usd), 1);
+  }, [spend.by_day]);
 
   const load = useCallback(async () => {
+    const minDelay = new Promise((resolve) => setTimeout(resolve, 900));
     try {
       setLoading(true);
-      setError("");
-      const to = new Date();
-      const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
-      const params = new URLSearchParams({
-        from: from.toISOString(),
-        to: to.toISOString(),
-      });
-
-      const [summaryData, alertsData, agentsData] = await Promise.all([
-        apiRequest(`/spend/summary?${params.toString()}`),
-        apiRequest("/spend/alerts"),
-        apiRequest("/agents"),
+      const [anomaliesData, alertsData, agentsData] = await Promise.all([
+        apiRequestWithRetry(`/spend/anomalies`),
+        apiRequestWithRetry("/spend/alerts"),
+        apiRequestWithRetry("/agents"),
       ]);
-      setSummary(summaryData);
-      setAlerts(alertsData);
-      setAgents(agentsData);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load spend data");
+
+      setAnomalies(
+        Array.isArray((anomaliesData as { anomalies?: SpendAnomaly[] })?.anomalies)
+          ? (anomaliesData as { anomalies: SpendAnomaly[] }).anomalies
+          : [],
+      );
+      setAlerts(Array.isArray(alertsData) ? (alertsData as SpendAlert[]) : []);
+      setAgents(Array.isArray(agentsData) ? (agentsData as Agent[]) : []);
+    } catch {
+      // intentionally silent
     } finally {
+      await minDelay;
       setLoading(false);
     }
   }, []);
@@ -105,25 +98,9 @@ export default function SpendPage() {
     load();
   }, [router, load]);
 
-  useEffect(() => {
-    const onRefresh = () => load();
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === "gateway:refresh-at") {
-        load();
-      }
-    };
-    window.addEventListener("gateway:refresh", onRefresh);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener("gateway:refresh", onRefresh);
-      window.removeEventListener("storage", onStorage);
-    };
-  }, [load]);
-
   const createAlert = async (event: FormEvent) => {
     event.preventDefault();
     try {
-      setError("");
       await apiRequest("/spend/alerts", {
         method: "POST",
         body: JSON.stringify({
@@ -134,100 +111,111 @@ export default function SpendPage() {
         }),
       });
       await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create alert");
+    } catch {
+      // intentionally silent
     }
   };
+
+  const projected = spend.total_usd * 4;
+  const budgetLimit = Math.max(5, Number(alerts[0]?.threshold_usd || 10));
+  const budgetUsage = Math.min(100, Math.round((projected / budgetLimit) * 100));
+  const budgetAtRisk = budgetUsage >= 80;
 
   return (
     <main className="container-page space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Spend</h1>
-          <p className="text-sm text-slate-600">AI spend tracing and threshold alerts for security governance.</p>
+          <h1 className="text-3xl font-extrabold tracking-tight section-title">
+            AI Spend Analytics
+            <InfoTooltip text="Real-time monitoring of token usage, model cost, and spend anomalies." />
+          </h1>
+          <p className="text-sm text-slate-600 mono">Real-time monitoring of token usage and infrastructure costs.</p>
         </div>
-        <button className="btn-secondary" onClick={load} disabled={loading}>
-          {loading ? "Refreshing..." : "Refresh"}
-        </button>
+        <div className="flex gap-2">
+          <button className="btn-primary">Export Report</button>
+        </div>
       </div>
 
-      {error ? <p className="text-sm text-red-600">{error}</p> : null}
-
-      <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <div className="card">
-          <p className="text-xs text-slate-500">Total Spend (Last 7 Days)</p>
-          <p className="text-2xl font-semibold">{formatMoney(summary.total_usd)}</p>
-        </div>
-        <div className="card">
-          <p className="text-xs text-slate-500">Triggered Alerts</p>
-          <p className="text-2xl font-semibold">{summary.alerts_triggered.length}</p>
-        </div>
-        <div className="card">
-          <p className="text-xs text-slate-500">Top Tool</p>
-          <p className="text-2xl font-semibold">{summary.top_tools[0]?.tool || "-"}</p>
+      <section className={`card spend-warning ${budgetAtRisk ? "warning" : ""}`}>
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <p className="font-semibold mono">{budgetAtRisk ? "BUDGET WARNING" : "BUDGET HEALTHY"}</p>
+            <p className="text-sm text-slate-600">Projected monthly usage is {budgetUsage}% of the configured budget threshold.</p>
+          </div>
+          <span className={budgetAtRisk ? "badge badge-pending" : "badge badge-allow"}>{budgetUsage}% used</span>
         </div>
       </section>
 
-      <section className="card space-y-2">
-        <h2 className="font-semibold">Spend by Day</h2>
-        {summary.by_day.length === 0 ? (
-          <p className="text-sm text-slate-600">No spend data yet. Run simulator to generate tool calls and costs.</p>
-        ) : (
-          <div className="space-y-2">
-            {summary.by_day.map((item) => (
-              <div key={item.day} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-sm">
-                <span className="text-slate-600">{item.day}</span>
-                <div className="h-3 bg-slate-100 rounded overflow-hidden">
-                  <div className="h-full bg-accent" style={{ width: `${Math.max((item.usd / maxDayUsd) * 100, 4)}%` }} />
+      <section className="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <div className="card stat-card-enterprise"><p className="stat-label">Total Spend (MTD)</p><p className="stat-number">{formatBudgetShort(spend.total_usd)}</p></div>
+        <div className="card stat-card-enterprise"><p className="stat-label">Projected Spend</p><p className="stat-number">{formatBudget(projected)}</p></div>
+        <div className="card stat-card-enterprise"><p className="stat-label">Total Tokens</p><p className="stat-number">{providers.reduce((acc, row) => acc + row.tokens_in + row.tokens_out, 0)}</p></div>
+        <div className="card stat-card-enterprise"><p className="stat-label">Budget Status</p><p className="stat-number">{budgetAtRisk ? "AT RISK" : "OK"}</p></div>
+      </section>
+
+      <section className="grid grid-cols-1 xl:grid-cols-[1.2fr_0.8fr] gap-3">
+        <div className="card">
+          <div className="card-header"><h2 className="font-semibold">Monthly Spend by Day</h2><span className="badge">7d</span></div>
+          {loading ? (
+            <div className="space-y-2">{Array.from({ length: 6 }).map((_, idx) => <div key={idx} className="skeleton skeleton-row" />)}</div>
+          ) : (
+            <div className="space-y-2">
+              {spend.by_day.map((item) => (
+                <div key={item.day} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-sm">
+                  <span className="text-slate-600 mono">{item.day}</span>
+                  <div className="h-3 bg-slate-100 rounded overflow-hidden">
+                    <div className="h-full" style={{ width: `${Math.max((item.usd / maxDayUsd) * 100, 4)}%`, background: "var(--accent-primary)" }} />
+                  </div>
+                  <span className="text-right font-medium mono">{formatBudget(item.usd)}</span>
                 </div>
-                <span className="text-right font-medium">{formatMoney(item.usd)}</span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="card space-y-2">
+          <h2 className="font-semibold">Spend by Provider</h2>
+          {providers.map((row) => (
+            <div key={row.provider} className="provider-row">
+              <div>
+                <p className="font-semibold">{row.provider}</p>
+                <p className="text-xs text-slate-600 mono">events={row.events} shadow={row.shadow_events}</p>
+              </div>
+              <p className="mono font-semibold">{formatMoney(row.usd)}</p>
+            </div>
+          ))}
+          {!providers.length ? <p className="text-sm text-slate-600">No provider data yet.</p> : null}
+        </div>
+      </section>
+
+      <section className="grid grid-cols-1 xl:grid-cols-[1fr_1fr] gap-3">
+        <div className="card">
+          <div className="card-header"><h2 className="font-semibold">Top Models by Cost</h2></div>
+          <div className="space-y-3">
+            {spend.top_tools.map((row) => (
+              <div key={row.tool}>
+                <div className="flex items-center justify-between text-sm mb-1">
+                  <span className="mono">{row.tool}</span>
+                  <span className="mono">{formatBudget(row.usd)}</span>
+                </div>
+                <div className="risk-progress-track"><div className="risk-progress-fill" style={{ width: `${Math.max(8, (row.usd / Math.max(spend.total_usd, 1)) * 100)}%` }} /></div>
               </div>
             ))}
           </div>
-        )}
-      </section>
-
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div className="card">
-          <h2 className="font-semibold mb-2">Top Agents</h2>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left border-b">
-                <th className="py-2">Agent</th>
-                <th className="py-2">USD</th>
-                <th className="py-2">Tool Calls</th>
-              </tr>
-            </thead>
-            <tbody>
-              {summary.top_agents.map((row) => (
-                <tr key={row.agent_id} className="border-b">
-                  <td className="py-2">{row.agent_name || row.agent_id}</td>
-                  <td>{formatMoney(row.usd)}</td>
-                  <td>{row.tool_calls}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
 
-        <div className="card">
-          <h2 className="font-semibold mb-2">Top Tools</h2>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left border-b">
-                <th className="py-2">Tool</th>
-                <th className="py-2">USD</th>
-              </tr>
-            </thead>
-            <tbody>
-              {summary.top_tools.map((row) => (
-                <tr key={row.tool} className="border-b">
-                  <td className="py-2">{row.tool}</td>
-                  <td>{formatMoney(row.usd)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="card space-y-2">
+          <div className="card-header"><h2 className="font-semibold">Cost Anomalies</h2></div>
+          {anomalies.slice(0, 5).map((item) => (
+            <div key={item.id} className="anomaly-row">
+              <div>
+                <p className="font-semibold">Spike in usage</p>
+                <p className="text-xs text-slate-600 mono">{item.scope_type}:{item.scope_id} • {item.anomaly_date}</p>
+              </div>
+              <span className={item.spike_percent >= 300 ? "badge badge-blocked" : "badge badge-pending"}>+{item.spike_percent.toFixed(0)}%</span>
+            </div>
+          ))}
+          {!anomalies.length ? <p className="text-sm text-slate-600">No anomalies in selected window.</p> : null}
         </div>
       </section>
 
@@ -235,51 +223,35 @@ export default function SpendPage() {
         <div className="card space-y-3">
           <h2 className="font-semibold">Create Spend Alert</h2>
           <form onSubmit={createAlert} className="space-y-2">
-            <select className="input" value={scopeType} onChange={(event) => setScopeType(event.target.value as "agent" | "org")}>
+            <select className="input" value={scopeType} onChange={(event) => setScopeType(event.target.value as "agent" | "org")}> 
               <option value="org">Organization</option>
               <option value="agent">Agent</option>
             </select>
             {scopeType === "agent" ? (
               <select className="input" value={scopeId} onChange={(event) => setScopeId(event.target.value)} required>
                 <option value="">Select agent</option>
-                {agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>{agent.name}</option>
-                ))}
+                {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
               </select>
             ) : null}
-            <select className="input" value={period} onChange={(event) => setPeriod(event.target.value as "daily" | "monthly")}>
+            <select className="input" value={period} onChange={(event) => setPeriod(event.target.value as "daily" | "monthly")}> 
               <option value="daily">Daily</option>
               <option value="monthly">Monthly</option>
             </select>
-            <input
-              className="input"
-              type="number"
-              min="0"
-              step="0.01"
-              value={thresholdUsd}
-              onChange={(event) => setThresholdUsd(event.target.value)}
-              placeholder="Threshold USD"
-              required
-            />
+            <input className="input" type="number" min="0" step="0.01" value={thresholdUsd} onChange={(event) => setThresholdUsd(event.target.value)} required />
             <button className="btn-primary" type="submit">Create Alert</button>
           </form>
         </div>
 
-        <div className="card">
-          <h2 className="font-semibold mb-2">Alerts</h2>
-          {alerts.length === 0 ? (
-            <p className="text-sm text-slate-600">No alerts configured.</p>
-          ) : (
-            <ul className="space-y-2 text-sm">
-              {alerts.map((alert) => (
-                <li key={alert.id} className="border border-slate-200 rounded p-2">
-                  <p className="font-medium">{alert.scope_type.toUpperCase()} | {alert.period.toUpperCase()} | ${Number(alert.threshold_usd).toFixed(2)}</p>
-                  <p className="text-slate-600">status={alert.status} | scope_id={alert.scope_id || "org"}</p>
-                  <p className="text-slate-500">last_triggered_at={formatDate(alert.last_triggered_at)}</p>
-                </li>
-              ))}
-            </ul>
-          )}
+        <div className="card space-y-2">
+          <h2 className="font-semibold">Alerts</h2>
+          {alerts.map((alert) => (
+            <div key={alert.id} className="border border-[var(--border)] rounded p-2">
+              <p className="mono font-semibold">{alert.scope_type.toUpperCase()} | {alert.period.toUpperCase()} | ${Number(alert.threshold_usd).toFixed(2)}</p>
+              <p className="text-slate-600 mono">status={alert.status} | scope_id={alert.scope_id || "org"}</p>
+              <p className="text-slate-500 mono">last_triggered_at={formatDate(alert.last_triggered_at)}</p>
+            </div>
+          ))}
+          {!alerts.length ? <p className="text-sm text-slate-600">No alerts configured.</p> : null}
         </div>
       </section>
     </main>

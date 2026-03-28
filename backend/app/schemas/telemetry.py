@@ -36,15 +36,14 @@ class TelemetryIngestResponse(BaseModel):
 
 
 class ShadowAIEventOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: UUID
     provider: str
-    api_key_fingerprint: str | None
+    masked_key: str | None = None
     model: str | None
     detected_source: str
     source_hint: str | None
     cost_usd: Decimal
     tokens_in: int | None
     tokens_out: int | None
-    timestamp: datetime
+    user_identifier: str | None = None
+    created_at: datetime

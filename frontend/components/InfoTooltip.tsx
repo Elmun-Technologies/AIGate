@@ -2,46 +2,33 @@
 
 import { useEffect, useRef, useState } from "react";
 
-type InfoTooltipProps = {
-  text: string;
-};
-
-export default function InfoTooltip({ text }: InfoTooltipProps) {
+export default function InfoTooltip({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLSpanElement | null>(null);
+  const ref = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
-    const onClickOutside = (event: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!rootRef.current.contains(event.target as Node)) {
+    const onPointerDown = (event: MouseEvent) => {
+      if (!ref.current) return;
+      if (!ref.current.contains(event.target as Node)) {
         setOpen(false);
       }
     };
-    document.addEventListener("mousedown", onClickOutside);
-    return () => document.removeEventListener("mousedown", onClickOutside);
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
   }, []);
 
   return (
     <span
-      ref={rootRef}
-      className="info-tip"
+      ref={ref}
+      className="tooltip-wrap"
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
+      onClick={() => setOpen((prev) => !prev)}
+      role="button"
+      tabIndex={0}
     >
-      <button
-        type="button"
-        className="info-tip-trigger"
-        onClick={() => setOpen((prev) => !prev)}
-        aria-label="How it works"
-      >
-        ⓘ
-      </button>
-      {open ? (
-        <span className="info-tip-popover" role="tooltip">
-          {text}
-          <span className="info-tip-arrow" />
-        </span>
-      ) : null}
+      <span className="tooltip-icon">ⓘ</span>
+      <span className={`tooltip-bubble ${open ? "open" : ""}`}>{text}</span>
     </span>
   );
 }
